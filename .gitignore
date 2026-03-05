@@ -1,0 +1,8 @@
+node_modules/*
+test*
+fix*
+patch*  
+make_dark_mode.js
+parse_check.js
+server.py
+package-lock.json
