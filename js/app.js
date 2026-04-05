@@ -14,6 +14,10 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
     const HISTORY_PERSIST_DELAY_MS = 250;
     // Leave headroom for other localStorage keys such as docState/theme.
     const MAX_HISTORY_STORAGE_BYTES = Math.floor(4.5 * 1024 * 1024);
+    const DUMMY_RESULT_VALUES = {
+        numeric: '42.0',
+        symbolic: '6\\cdot 7',
+    };
 
     let lastSelectedBlock = null;
     let dragState = null;
@@ -61,6 +65,82 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
 
     function isMathBlock(block) {
         return block?.tagName?.toLowerCase() === 'math-field';
+    }
+
+    function getMathResultValue(mode = 'numeric') {
+        return mode === 'symbolic' ? DUMMY_RESULT_VALUES.symbolic : DUMMY_RESULT_VALUES.numeric;
+    }
+
+    function getMathResultElement(block) {
+        if (!isMathBlock(block)) return null;
+
+        let sibling = block.nextElementSibling;
+        while (sibling && sibling !== selectionLayer) {
+            if (sibling.classList.contains('math-result')) {
+                return sibling;
+            }
+            if (sibling.classList.contains('block')) {
+                return null;
+            }
+            sibling = sibling.nextElementSibling;
+        }
+
+        return null;
+    }
+
+    function syncMathResult(block, mode = 'numeric') {
+        if (!isMathBlock(block)) return null;
+
+        let result = getMathResultElement(block);
+        if (!result) {
+            result = document.createElement('math-field');
+            result.className = 'math-result';
+            result.addEventListener('pointerdown', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                toggleMathResultMode(block);
+            });
+            container.insertBefore(result, getNextBlock(block) ?? selectionLayer);
+            result.readOnly = true;
+            result.setAttribute('read-only', '');
+            result.inlineShortcuts = null;
+            result.macros = {
+                ...result.macros,
+                pmb: { args: 1, def: "\\boldsymbol{#1}" },
+                eig: "\\text{eig}",
+                eigv: "\\text{eigv}",
+            };
+        }
+
+        block.dataset.resultVisible = 'true';
+        block.dataset.resultMode = mode;
+        result.dataset.mode = mode;
+        result.value = getMathResultValue(mode);
+        result.title = `Click to switch to ${mode === 'numeric' ? 'symbolic' : 'numeric'}`;
+        return result;
+    }
+
+    function showMathResult(block, mode = 'numeric') {
+        syncMathResult(block, mode);
+    }
+
+    function toggleMathResultMode(block) {
+        if (!isMathBlock(block)) return;
+        const nextMode = block.dataset.resultMode === 'symbolic' ? 'numeric' : 'symbolic';
+        syncMathResult(block, nextMode);
+        saveState();
+    }
+
+    function removeMathResult(block) {
+        if (!isMathBlock(block)) return;
+        getMathResultElement(block)?.remove();
+        delete block.dataset.resultVisible;
+        delete block.dataset.resultMode;
+    }
+
+    function removeBlockWithResult(block) {
+        removeMathResult(block);
+        block.remove();
     }
 
     function clamp(value, min, max) {
@@ -566,7 +646,7 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
         let remainingBlocks = getBlocks();
         for (const block of [...remainingBlocks]) {
             if (getBlockLength(block) === 0 && remainingBlocks.length > 1) {
-                block.remove();
+                removeBlockWithResult(block);
                 remainingBlocks = getBlocks();
             }
         }
@@ -600,7 +680,7 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
     // Use capture phase so MathLive and contenteditable blocks cannot hide cross-block drags.
     document.addEventListener('pointerdown', (e) => {
         if (e.isPrimary === false || e.pointerType === 'mouse' && e.button !== 0) return;
-        if (e.target.closest('.toolbar')) return;
+        if (e.target.closest('.toolbar') || e.target.closest('.math-result')) return;
 
         const point = getPointFromClientCoordinates(e.clientX, e.clientY);
         if (!point) return;
@@ -654,7 +734,7 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
             return;
         }
 
-        if (!e.target.closest('.block') && !e.target.closest('.toolbar')) {
+        if (!e.target.closest('.block') && !e.target.closest('.toolbar') && !e.target.closest('.math-result')) {
             clearCrossBlockSelection();
             clearSelection();
         }
@@ -809,7 +889,7 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
         });
 
         if (!hasCrossSelection && selected.length > 1) {
-             selected.forEach((block) => block.remove());
+            selected.forEach((block) => removeBlockWithResult(block));
         }
 
         if (currentRef) {
@@ -833,7 +913,7 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
         const firstSelected = selected[0];
         let prev = getPreviousBlock(firstSelected);
         
-        selected.forEach(b => b.remove());
+        selected.forEach((block) => removeBlockWithResult(block));
         
         if (prev && prev.classList.contains('block')) {
             prev.focus();
@@ -857,7 +937,12 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
 
     function getSerializedHistoryEntry(snapshot) {
         return {
-            b: snapshot.blocks.map((block) => [block.type === 'math' ? 1 : 0, block.value]),
+            b: snapshot.blocks.map((block) => [
+                block.type === 'math' ? 1 : 0,
+                block.value,
+                block.type === 'math' && block.resultVisible ? 1 : 0,
+                block.type === 'math' && block.resultMode === 'symbolic' ? 1 : 0,
+            ]),
             f: [
                 snapshot.focus?.index ?? 0,
                 snapshot.focus?.offset ?? 0,
@@ -945,7 +1030,7 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
         const blocks = entry.b.map((block) => {
             if (!Array.isArray(block) || block.length < 2) return null;
 
-            const [typeFlag, value] = block;
+            const [typeFlag, value, resultVisibleFlag, resultModeFlag] = block;
             if ((typeFlag !== 0 && typeFlag !== 1) || typeof value !== 'string') {
                 return null;
             }
@@ -953,6 +1038,8 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
             return {
                 type: typeFlag === 1 ? 'math' : 'text',
                 value,
+                resultVisible: typeFlag === 1 && resultVisibleFlag === 1,
+                resultMode: typeFlag === 1 && resultModeFlag === 1 ? 'symbolic' : 'numeric',
             };
         });
 
@@ -1031,6 +1118,8 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
         return getBlocks().map((block) => ({
             type: isMathBlock(block) ? 'math' : 'text',
             value: isMathBlock(block) ? block.value : getTextBlockValue(block),
+            resultVisible: isMathBlock(block) && !!getMathResultElement(block),
+            resultMode: isMathBlock(block) && block.dataset.resultMode === 'symbolic' ? 'symbolic' : 'numeric',
         }));
     }
 
@@ -1071,7 +1160,10 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
 
         snapshot.blocks.forEach((block) => {
             if (block.type === 'math') {
-                appendMathBlock(block.value);
+                appendMathBlock(block.value, null, {
+                    visible: block.resultVisible,
+                    mode: block.resultMode,
+                });
             } else {
                 appendTextBlock(block.value);
             }
@@ -1214,7 +1306,7 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
         fileInput.value = '';
     });
 
-    function appendMathBlock(latex = null, refNode = null) {
+    function appendMathBlock(latex = null, refNode = null, resultState = null) {
         const mf = document.createElement('math-field');
         mf.classList.add('math-line', 'block');
         
@@ -1226,11 +1318,14 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
         mf.inlineShortcuts = null;
         mf.macros = {
             ...mf.macros,
-            const: { args: 1, def: "\\boldsymbol{#1}" },
+            pmb: { args: 1, def: "\\boldsymbol{#1}" },
             eig: "\\text{eig}",
             eigv: "\\text{eigv}",
         };
         if (latex !== null) mf.value = latex;
+        if (resultState?.visible) {
+            showMathResult(mf, resultState.mode === 'symbolic' ? 'symbolic' : 'numeric');
+        }
         return mf;
     }
 
@@ -1307,6 +1402,7 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
                     e.stopPropagation();
                     e.stopImmediatePropagation();
                     el.executeCommand('complete');
+                    showMathResult(el, 'numeric');
                     saveState();
                 }
             }, true);
@@ -1328,6 +1424,9 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 e.stopPropagation();
+                if (isMath) {
+                    showMathResult(el, 'numeric');
+                }
                 insertBlockBelow(el, isMath);
             } else if (e.key === 'Backspace') {
                 const isEmpty = isMath ? el.value === '' : el.innerText.trim() === '';
@@ -1349,7 +1448,7 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
                             sel.addRange(range);
                         }
                     }
-                    el.remove();
+                    removeBlockWithResult(el);
                     saveState();
                 }
             } else if (e.key === 'ArrowUp') {

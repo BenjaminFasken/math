@@ -107,6 +107,40 @@ math-field, .text-line {
     z-index: 1;
 }
 
+.math-result {
+    align-self: flex-end;
+    margin: -0.15rem 0.5rem 0.35rem 0;
+    width: auto;
+    padding: 0;
+    border-radius: 0;
+    background: transparent !important;
+    color: var(--text-color);
+    cursor: pointer;
+    font-size: 0.95rem;
+    line-height: 1.2;
+    user-select: none;
+    position: relative;
+    z-index: 1;
+}
+
+.math-result:hover {
+    background: transparent !important;
+}
+
+body.dark-mode .math-result {
+    background: transparent !important;
+}
+
+body.dark-mode .math-result:hover {
+    background: transparent !important;
+}
+
+math-field.math-result::part(menu-toggle),
+math-field.math-result::part(virtual-keyboard-toggle) {
+    visibility: hidden;
+    opacity: 0;
+}
+
 .text-line {
     font-family: inherit;
     min-height: 2.5rem;
