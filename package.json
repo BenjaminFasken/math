@@ -7,13 +7,15 @@
     "lib": "lib"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node scripts/verify-tests.js",
+    "verify:tests": "node scripts/verify-tests.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@cortex-js/compute-engine": "^0.55.0",
-    "puppeteer": "^24.38.0"
+    "puppeteer": "^24.38.0",
+    "pyodide": "^0.27.0"
   }
 }

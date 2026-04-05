@@ -14,9 +14,9 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
     const HISTORY_PERSIST_DELAY_MS = 250;
     // Leave headroom for other localStorage keys such as docState/theme.
     const MAX_HISTORY_STORAGE_BYTES = Math.floor(4.5 * 1024 * 1024);
-    const DUMMY_RESULT_VALUES = {
-        numeric: '42.0',
-        symbolic: '6\\cdot 7',
+    const RESULT_STATUS_VALUES = {
+        loading: '\\text{Loading}',
+        error: '\\text{Error}',
     };
 
     let lastSelectedBlock = null;
@@ -27,6 +27,7 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
     let historyIndex = -1;
     let isRestoringHistory = false;
     let historyPersistTimer = null;
+    let evaluatorRuntimePromise = null;
 
     function ensureSelectionLayer() {
         if (!selectionLayer.isConnected) {
@@ -67,8 +68,108 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
         return block?.tagName?.toLowerCase() === 'math-field';
     }
 
-    function getMathResultValue(mode = 'numeric') {
-        return mode === 'symbolic' ? DUMMY_RESULT_VALUES.symbolic : DUMMY_RESULT_VALUES.numeric;
+    function getEvaluatorOptions() {
+        const baseUrl = new URL('.', window.location.href);
+        return {
+            indexURL: new URL('node_modules/pyodide/', baseUrl).href,
+            pythonBridgeUrl: new URL('py/python-bridge.py', baseUrl).href,
+            symengineWheelUrl: new URL('lib/symengine-0.14.1-cp312-cp312-pyodide_2024_0_wasm32.whl', baseUrl).href,
+        };
+    }
+
+    function getResultFallbackValue(block, mode = 'numeric') {
+        if (block?._resultErrorLatex) return block._resultErrorLatex;
+        return RESULT_STATUS_VALUES.loading;
+    }
+
+    function getMathResultValue(block, mode = 'numeric') {
+        const evaluation = block?._resultEvaluation;
+        if (!evaluation) {
+            return getResultFallbackValue(block, mode);
+        }
+        return mode === 'symbolic' ? evaluation.symbolic : evaluation.numeric;
+    }
+
+    async function ensureEvaluatorRuntime() {
+        if (evaluatorRuntimePromise) {
+            return evaluatorRuntimePromise;
+        }
+        if (!window.MathEditorEvaluator?.createEvaluatorRuntime) {
+            throw new Error('Evaluator runtime is not available');
+        }
+
+        evaluatorRuntimePromise = window.MathEditorEvaluator.createEvaluatorRuntime(getEvaluatorOptions()).catch((error) => {
+            evaluatorRuntimePromise = null;
+            throw error;
+        });
+        return evaluatorRuntimePromise;
+    }
+
+    function getMathBlocksThrough(targetBlock) {
+        const blocks = getBlocks().filter((block) => isMathBlock(block));
+        const targetIndex = blocks.indexOf(targetBlock);
+        return targetIndex === -1 ? [] : blocks.slice(0, targetIndex + 1);
+    }
+
+    function formatResultError(error) {
+        const message = String(error?.message ?? error ?? 'Unknown error')
+            .replace(/[{}]/g, '')
+            .replace(/_/g, '\\_');
+        return `\\text{${message}}`;
+    }
+
+    async function requestMathResultEvaluation(block) {
+        if (!isMathBlock(block)) return;
+
+        const requestId = (block._resultRequestId ?? 0) + 1;
+        block._resultRequestId = requestId;
+        block._resultEvaluation = null;
+        delete block._resultErrorLatex;
+        syncMathResult(block, block.dataset.resultMode === 'symbolic' ? 'symbolic' : 'numeric');
+
+        try {
+            const runtime = await ensureEvaluatorRuntime();
+            const mathBlocks = getMathBlocksThrough(block);
+            const evaluation = await runtime.evaluateLatexBlocks(mathBlocks.map((mathBlock) => mathBlock.value));
+            const result = evaluation.results?.[evaluation.results.length - 1];
+            if (block._resultRequestId !== requestId) return;
+
+            if (!result) {
+                throw new Error('Missing evaluation result');
+            }
+
+            block._resultEvaluation = {
+                symbolic: result.symbolic ?? RESULT_STATUS_VALUES.error,
+                numeric: result.numeric ?? RESULT_STATUS_VALUES.error,
+            };
+            delete block._resultErrorLatex;
+            syncMathResult(block, block.dataset.resultMode === 'symbolic' ? 'symbolic' : 'numeric');
+        } catch (error) {
+            if (block._resultRequestId !== requestId) return;
+            block._resultEvaluation = null;
+            block._resultErrorLatex = formatResultError(error);
+            syncMathResult(block, block.dataset.resultMode === 'symbolic' ? 'symbolic' : 'numeric');
+        }
+    }
+
+    function invalidateAllMathEvaluations() {
+        getBlocks().forEach((block) => {
+            if (!isMathBlock(block)) return;
+            block._resultEvaluation = null;
+            delete block._resultErrorLatex;
+            block._resultRequestId = 0;
+            if (getMathResultElement(block)) {
+                syncMathResult(block, block.dataset.resultMode === 'symbolic' ? 'symbolic' : 'numeric');
+            }
+        });
+    }
+
+    function refreshVisibleMathResults() {
+        getBlocks().forEach((block) => {
+            if (isMathBlock(block) && getMathResultElement(block)) {
+                requestMathResultEvaluation(block);
+            }
+        });
     }
 
     function getMathResultElement(block) {
@@ -115,19 +216,23 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
         block.dataset.resultVisible = 'true';
         block.dataset.resultMode = mode;
         result.dataset.mode = mode;
-        result.value = getMathResultValue(mode);
+        result.value = getMathResultValue(block, mode);
         result.title = `Click to switch to ${mode === 'numeric' ? 'symbolic' : 'numeric'}`;
         return result;
     }
 
     function showMathResult(block, mode = 'numeric') {
         syncMathResult(block, mode);
+        requestMathResultEvaluation(block);
     }
 
     function toggleMathResultMode(block) {
         if (!isMathBlock(block)) return;
         const nextMode = block.dataset.resultMode === 'symbolic' ? 'numeric' : 'symbolic';
         syncMathResult(block, nextMode);
+        if (!block._resultEvaluation && !block._resultErrorLatex) {
+            requestMathResultEvaluation(block);
+        }
         saveState();
     }
 
@@ -136,6 +241,9 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
         getMathResultElement(block)?.remove();
         delete block.dataset.resultVisible;
         delete block.dataset.resultMode;
+        block._resultEvaluation = null;
+        delete block._resultErrorLatex;
+        block._resultRequestId = 0;
     }
 
     function removeBlockWithResult(block) {
@@ -1270,10 +1378,12 @@ document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6
 
     // Auto save on input
     container.addEventListener('input', () => {
+        invalidateAllMathEvaluations();
         if (hasExpandedCrossBlockSelection()) {
             clearCrossBlockSelection();
             clearSelection();
         }
+        refreshVisibleMathResults();
         saveState();
     });
 
