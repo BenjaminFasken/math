@@ -36,7 +36,21 @@ body {
     display: flex;
     flex-direction: column;
     gap: 0.2rem;
+    position: relative;
     transition: background-color 0.3s, color 0.3s;
+}
+
+.document-selection-layer {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 5;
+}
+
+.selection-rect {
+    position: absolute;
+    background: rgba(33, 150, 243, 0.24);
+    border-radius: 0.25rem;
 }
 
 .top-hit-area {
@@ -89,6 +103,8 @@ math-field, .text-line {
     background: transparent;
     color: var(--text-color);
     box-sizing: border-box;
+    position: relative;
+    z-index: 1;
 }
 
 .text-line {
@@ -110,4 +126,19 @@ math-field:not(:focus-within)::part(menu-toggle) {
 math-field:not(:focus-within)::part(virtual-keyboard-toggle) {
     visibility: hidden;
     opacity: 0;
+}
+
+.selected {
+    background-color: rgba(33, 150, 243, 0.08) !important;
+    border: 1px solid rgba(33, 150, 243, 0.5) !important;
+    border-radius: 4px;
+}
+
+body.dark-mode .selected {
+    background-color: rgba(33, 150, 243, 0.16) !important;
+    border: 1px solid rgba(33, 150, 243, 0.8) !important;
+}
+
+body.dark-mode .selection-rect {
+    background: rgba(100, 181, 246, 0.3);
 }

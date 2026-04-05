@@ -7,6 +7,634 @@ document.addEventListener('DOMContentLoaded', () => {
     const loadBtn = document.getElementById('btn-load');
     const fileInput = document.getElementById('file-input');
 
+    const selectionLayer = document.createElement('div');
+    selectionLayer.className = 'document-selection-layer';
+
+    let lastSelectedBlock = null;
+    let dragState = null;
+    let crossBlockSelection = null;
+    let suppressDocumentClickClear = false;
+
+    function ensureSelectionLayer() {
+        if (!selectionLayer.isConnected) {
+            container.appendChild(selectionLayer);
+        }
+    }
+
+    function getBlocks() {
+        return Array.from(container.querySelectorAll('.block'));
+    }
+
+    function getFirstBlock() {
+        return getBlocks()[0] ?? null;
+    }
+
+    function getLastBlock() {
+        const blocks = getBlocks();
+        return blocks[blocks.length - 1] ?? null;
+    }
+
+    function getPreviousBlock(block) {
+        let previous = block.previousElementSibling;
+        while (previous && !previous.classList.contains('block')) {
+            previous = previous.previousElementSibling;
+        }
+        return previous;
+    }
+
+    function getNextBlock(block) {
+        let next = block.nextElementSibling;
+        while (next && !next.classList.contains('block')) {
+            next = next.nextElementSibling;
+        }
+        return next;
+    }
+
+    function isMathBlock(block) {
+        return block?.tagName?.toLowerCase() === 'math-field';
+    }
+
+    function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    function clearSelection(except = null) {
+        getBlocks().forEach((block) => {
+            if (block !== except) block.classList.remove('selected');
+        });
+    }
+
+    function clearCrossBlockSelection() {
+        crossBlockSelection = null;
+        selectionLayer.innerHTML = '';
+    }
+
+    function getSelectedBlocks() {
+        return Array.from(container.querySelectorAll('.selected'));
+    }
+
+    function blocksToString(blocks) {
+        let content = [];
+        for (const el of blocks) {
+            if (isMathBlock(el)) {
+                content.push(`$$ ${el.value} $$`);
+            } else if (el.classList.contains('text-line')) {
+                content.push(el.innerText.trim());
+            }
+        }
+        return content.join('\n\n');
+    }
+
+    function getTextBlockValue(block) {
+        return block.textContent ?? '';
+    }
+
+    function setTextBlockValue(block, text) {
+        block.textContent = text;
+    }
+
+    function getTextLength(block) {
+        const range = document.createRange();
+        range.selectNodeContents(block);
+        return range.toString().length;
+    }
+
+    function getTextOffsetFromDomPosition(block, node, offset) {
+        const range = document.createRange();
+        range.selectNodeContents(block);
+        try {
+            range.setEnd(node, offset);
+        } catch {
+            return getTextLength(block);
+        }
+        return range.toString().length;
+    }
+
+    function getTextPositionFromOffset(block, targetOffset) {
+        let remaining = clamp(targetOffset, 0, getTextLength(block));
+        const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+        let node = walker.nextNode();
+        let lastTextNode = null;
+
+        while (node) {
+            lastTextNode = node;
+            const length = node.textContent.length;
+            if (remaining <= length) {
+                return { node, offset: remaining };
+            }
+            remaining -= length;
+            node = walker.nextNode();
+        }
+
+        if (lastTextNode) {
+            return { node: lastTextNode, offset: lastTextNode.textContent.length };
+        }
+
+        return { node: block, offset: block.childNodes.length };
+    }
+
+    function getTextOffsetFromPoint(block, clientX, clientY) {
+        if (document.caretPositionFromPoint) {
+            const position = document.caretPositionFromPoint(clientX, clientY);
+            if (position && block.contains(position.offsetNode)) {
+                return clamp(
+                    getTextOffsetFromDomPosition(block, position.offsetNode, position.offset),
+                    0,
+                    getTextLength(block)
+                );
+            }
+        }
+
+        if (document.caretRangeFromPoint) {
+            const range = document.caretRangeFromPoint(clientX, clientY);
+            if (range && block.contains(range.startContainer)) {
+                return clamp(
+                    getTextOffsetFromDomPosition(block, range.startContainer, range.startOffset),
+                    0,
+                    getTextLength(block)
+                );
+            }
+        }
+
+        const rect = block.getBoundingClientRect();
+        return clientX <= rect.left + rect.width / 2 ? 0 : getTextLength(block);
+    }
+
+    function setTextCaret(block, offset) {
+        const position = getTextPositionFromOffset(block, offset);
+        const range = document.createRange();
+        const selection = window.getSelection();
+
+        range.setStart(position.node, position.offset);
+        range.collapse(true);
+        selection.removeAllRanges();
+        selection.addRange(range);
+    }
+
+    function getBlockLength(block) {
+        return isMathBlock(block) ? block.lastOffset : getTextLength(block);
+    }
+
+    function mergeSelectionRects(clientRects, containerRect) {
+        const rects = clientRects
+            .filter((rect) => rect.width > 0 && rect.height > 0)
+            .map((rect) => ({
+                left: rect.left - containerRect.left,
+                top: rect.top - containerRect.top,
+                width: rect.width,
+                height: rect.height,
+            }))
+            .sort((a, b) => (a.top - b.top) || (a.left - b.left));
+
+        const merged = [];
+
+        for (const rect of rects) {
+            const previous = merged[merged.length - 1];
+            const isSameLine = previous
+                && Math.abs(previous.top - rect.top) < 6
+                && Math.abs(previous.height - rect.height) < 10;
+
+            if (isSameLine && rect.left <= previous.left + previous.width + 8) {
+                const left = Math.min(previous.left, rect.left);
+                const right = Math.max(previous.left + previous.width, rect.left + rect.width);
+                previous.left = left;
+                previous.width = right - left;
+                previous.top = Math.min(previous.top, rect.top);
+                previous.height = Math.max(previous.height, rect.height);
+            } else {
+                merged.push(rect);
+            }
+        }
+
+        return merged;
+    }
+
+    function getTextSelectionRects(block, start, end, containerRect) {
+        if (start === end) return [];
+
+        const range = document.createRange();
+        const startPosition = getTextPositionFromOffset(block, start);
+        const endPosition = getTextPositionFromOffset(block, end);
+
+        try {
+            range.setStart(startPosition.node, startPosition.offset);
+            range.setEnd(endPosition.node, endPosition.offset);
+        } catch {
+            return [];
+        }
+
+        return mergeSelectionRects(Array.from(range.getClientRects()), containerRect);
+    }
+
+    function getMathSelectionRects(block, start, end, containerRect) {
+        const min = clamp(Math.min(start, end), 0, block.lastOffset);
+        const max = clamp(Math.max(start, end), 0, block.lastOffset);
+        if (min === max) return [];
+
+        const rects = [];
+        for (let offset = min + 1; offset <= max; offset += 1) {
+            const bounds = block.getElementInfo(offset)?.bounds;
+            if (bounds && bounds.width > 0 && bounds.height > 0) {
+                rects.push(bounds);
+            }
+        }
+
+        if (rects.length === 0) {
+            const blockRect = block.getBoundingClientRect();
+            rects.push(new DOMRect(
+                blockRect.left + 8,
+                blockRect.top + 8,
+                Math.max(0, blockRect.width - 16),
+                Math.max(0, blockRect.height - 16)
+            ));
+        }
+
+        return mergeSelectionRects(rects, containerRect);
+    }
+
+    function appendSelectionRect(rect) {
+        const node = document.createElement('div');
+        node.className = 'selection-rect';
+        node.style.left = `${rect.left}px`;
+        node.style.top = `${rect.top}px`;
+        node.style.width = `${rect.width}px`;
+        node.style.height = `${rect.height}px`;
+        selectionLayer.appendChild(node);
+    }
+
+    function findClosestBlockByY(clientY) {
+        const blocks = getBlocks();
+        if (blocks.length === 0) return null;
+
+        let bestBlock = blocks[0];
+        let bestDistance = Number.POSITIVE_INFINITY;
+
+        for (const block of blocks) {
+            const rect = block.getBoundingClientRect();
+            if (clientY >= rect.top && clientY <= rect.bottom) {
+                return block;
+            }
+
+            const distance = Math.min(Math.abs(clientY - rect.top), Math.abs(clientY - rect.bottom));
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestBlock = block;
+            }
+        }
+
+        return bestBlock;
+    }
+
+    function getBlockAtPoint(clientX, clientY) {
+        const hovered = document.elementFromPoint(clientX, clientY);
+        return hovered?.closest('.block') ?? findClosestBlockByY(clientY);
+    }
+
+    function getPointFromClientCoordinates(clientX, clientY) {
+        const block = getBlockAtPoint(clientX, clientY);
+        if (!block) return null;
+
+        const blocks = getBlocks();
+        const index = blocks.indexOf(block);
+        if (index === -1) return null;
+
+        const offset = isMathBlock(block)
+            ? clamp(block.getOffsetFromPoint(clientX, clientY), 0, block.lastOffset)
+            : getTextOffsetFromPoint(block, clientX, clientY);
+
+        return { block, index, offset };
+    }
+
+    function compareSelectionPoints(a, b) {
+        if (a.index !== b.index) return a.index - b.index;
+        return a.offset - b.offset;
+    }
+
+    function getNormalizedCrossBlockSelection() {
+        if (!crossBlockSelection?.anchor || !crossBlockSelection?.focus) return null;
+
+        const blocks = getBlocks();
+        const anchor = {
+            ...crossBlockSelection.anchor,
+            index: blocks.indexOf(crossBlockSelection.anchor.block),
+        };
+        const focus = {
+            ...crossBlockSelection.focus,
+            index: blocks.indexOf(crossBlockSelection.focus.block),
+        };
+
+        if (anchor.index === -1 || focus.index === -1) return null;
+        return compareSelectionPoints(anchor, focus) <= 0
+            ? { start: anchor, end: focus }
+            : { start: focus, end: anchor };
+    }
+
+    function hasExpandedCrossBlockSelection() {
+        const selection = getNormalizedCrossBlockSelection();
+        return !!selection
+            && (selection.start.index !== selection.end.index || selection.start.offset !== selection.end.offset);
+    }
+
+    function renderCrossBlockSelection() {
+        ensureSelectionLayer();
+        selectionLayer.innerHTML = '';
+        clearSelection();
+
+        if (!hasExpandedCrossBlockSelection()) return;
+
+        const blocks = getBlocks();
+        const containerRect = container.getBoundingClientRect();
+        const selection = getNormalizedCrossBlockSelection();
+
+        for (let index = selection.start.index; index <= selection.end.index; index += 1) {
+            const block = blocks[index];
+            const start = index === selection.start.index ? selection.start.offset : 0;
+            const end = index === selection.end.index ? selection.end.offset : getBlockLength(block);
+            const rects = isMathBlock(block)
+                ? getMathSelectionRects(block, start, end, containerRect)
+                : getTextSelectionRects(block, start, end, containerRect);
+
+            block.classList.add('selected');
+            rects.forEach(appendSelectionRect);
+        }
+    }
+
+    function getCrossBlockSelectionText() {
+        const selection = getNormalizedCrossBlockSelection();
+        if (!selection || !hasExpandedCrossBlockSelection()) return '';
+
+        const blocks = getBlocks();
+        const content = [];
+
+        for (let index = selection.start.index; index <= selection.end.index; index += 1) {
+            const block = blocks[index];
+            const start = index === selection.start.index ? selection.start.offset : 0;
+            const end = index === selection.end.index ? selection.end.offset : getBlockLength(block);
+
+            if (isMathBlock(block)) {
+                content.push(block.getValue(start, end, 'latex'));
+            } else {
+                content.push(getTextBlockValue(block).slice(start, end));
+            }
+        }
+
+        return content.join('\n');
+    }
+
+    function placeCaretInBlock(block, offset) {
+        clearCrossBlockSelection();
+        clearSelection();
+
+        block.classList.add('selected');
+        lastSelectedBlock = block;
+        block.focus();
+
+        if (isMathBlock(block)) {
+            block.position = clamp(offset, 0, block.lastOffset);
+        } else {
+            setTextCaret(block, clamp(offset, 0, getTextLength(block)));
+        }
+    }
+
+    function deleteCrossBlockSelection() {
+        const selection = getNormalizedCrossBlockSelection();
+        if (!selection || !hasExpandedCrossBlockSelection()) return null;
+
+        const blocks = getBlocks();
+        const startBlock = blocks[selection.start.index];
+
+        for (let index = selection.end.index; index >= selection.start.index; index -= 1) {
+            const block = blocks[index];
+            const start = index === selection.start.index ? selection.start.offset : 0;
+            const end = index === selection.end.index ? selection.end.offset : getBlockLength(block);
+
+            if (start === end) continue;
+
+            if (isMathBlock(block)) {
+                block.selection = { ranges: [[start, end]], direction: 'forward' };
+                block.executeCommand('delete-backward');
+            } else {
+                const text = getTextBlockValue(block);
+                setTextBlockValue(block, text.slice(0, start) + text.slice(end));
+            }
+        }
+
+        let remainingBlocks = getBlocks();
+        for (const block of [...remainingBlocks]) {
+            if (getBlockLength(block) === 0 && remainingBlocks.length > 1) {
+                block.remove();
+                remainingBlocks = getBlocks();
+            }
+        }
+
+        if (remainingBlocks.length === 0) {
+            const freshBlock = appendMathBlock();
+            placeCaretInBlock(freshBlock, 0);
+            saveState();
+            return freshBlock;
+        }
+
+        const focusBlock = startBlock?.isConnected
+            ? startBlock
+            : remainingBlocks[Math.min(selection.start.index, remainingBlocks.length - 1)];
+        const focusOffset = startBlock?.isConnected ? selection.start.offset : 0;
+
+        placeCaretInBlock(focusBlock, focusOffset);
+        saveState();
+        return focusBlock;
+    }
+
+    function finishPointerSelection() {
+        dragState = null;
+        if (!hasExpandedCrossBlockSelection()) {
+            clearCrossBlockSelection();
+        }
+    }
+
+    ensureSelectionLayer();
+
+    // Use capture phase so MathLive and contenteditable blocks cannot hide cross-block drags.
+    document.addEventListener('pointerdown', (e) => {
+        if (e.isPrimary === false || e.pointerType === 'mouse' && e.button !== 0) return;
+        if (e.target.closest('.toolbar')) return;
+
+        const point = getPointFromClientCoordinates(e.clientX, e.clientY);
+        if (!point) return;
+
+        dragState = {
+            pointerId: e.pointerId,
+            anchor: point,
+            focus: point,
+            isCrossBlock: false,
+        };
+
+        if (!e.shiftKey) {
+            clearCrossBlockSelection();
+        }
+    }, { capture: true });
+
+    document.addEventListener('pointermove', (e) => {
+        if (!dragState || dragState.pointerId !== e.pointerId) return;
+        if (e.buttons !== 1 && e.pointerType === 'mouse') {
+            finishPointerSelection();
+            return;
+        }
+
+        const point = getPointFromClientCoordinates(e.clientX, e.clientY);
+        if (!point) return;
+
+        dragState.focus = point;
+        if (!dragState.isCrossBlock && point.index !== dragState.anchor.index) {
+            dragState.isCrossBlock = true;
+        }
+
+        if (!dragState.isCrossBlock) return;
+
+        suppressDocumentClickClear = true;
+        window.getSelection().removeAllRanges();
+        crossBlockSelection = { anchor: dragState.anchor, focus: point };
+        renderCrossBlockSelection();
+    }, { capture: true });
+
+    document.addEventListener('pointerup', finishPointerSelection, { capture: true });
+    document.addEventListener('pointercancel', finishPointerSelection, { capture: true });
+
+    document.addEventListener('click', (e) => {
+        if (suppressDocumentClickClear) {
+            suppressDocumentClickClear = false;
+            return;
+        }
+
+        if (!e.target.closest('.block') && !e.target.closest('.toolbar')) {
+            clearCrossBlockSelection();
+            clearSelection();
+        }
+    });
+
+    window.addEventListener('resize', () => {
+        if (hasExpandedCrossBlockSelection()) {
+            renderCrossBlockSelection();
+        }
+    });
+
+    document.addEventListener('scroll', () => {
+        if (hasExpandedCrossBlockSelection()) {
+            renderCrossBlockSelection();
+        }
+    }, true);
+
+    document.addEventListener('keydown', (e) => {
+        if (hasExpandedCrossBlockSelection()) {
+            if (e.key === 'Backspace' || e.key === 'Delete') {
+                e.preventDefault();
+                deleteCrossBlockSelection();
+                return;
+            }
+
+            if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'x')) {
+                e.preventDefault();
+                navigator.clipboard.writeText(getCrossBlockSelectionText());
+                if (e.key === 'x') {
+                    deleteCrossBlockSelection();
+                }
+                return;
+            }
+
+            if (e.key === 'Escape') {
+                clearCrossBlockSelection();
+                clearSelection();
+            }
+            return;
+        }
+
+        const selected = getSelectedBlocks();
+        if (selected.length > 1) {
+            if ((e.key === 'Backspace' || e.key === 'Delete')) {
+                e.preventDefault();
+                deleteSelected();
+            } else if (e.ctrlKey || e.metaKey) {
+                if (e.key === 'c' || e.key === 'x') {
+                    e.preventDefault();
+                    navigator.clipboard.writeText(blocksToString(selected));
+                    if (e.key === 'x') {
+                        deleteSelected();
+                    }
+                }
+            }
+        } else if (selected.length === 1 && (e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'x') && document.activeElement === document.body) {
+             // In case block is selected but not focused in a way that allows native copy
+             // Actually native copy covers it if single block is focused. But we can override to ensure format.
+             // We'll let native copy run for now.
+        }
+    });
+    
+    // We also need to handle Paste for multiple blocks.
+    document.addEventListener('paste', (e) => {
+        if (hasExpandedCrossBlockSelection()) {
+            deleteCrossBlockSelection();
+            return;
+        }
+
+        const text = (e.clipboardData || window.clipboardData).getData('text');
+        const selected = getSelectedBlocks();
+        const chunks = text.split(/\n\s*\n/);
+        
+        // Only override if pasting multiple blocks or pasting over multiple selected blocks
+        if (selected.length <= 1 && chunks.length <= 1) {
+            return; // Use default paste behavior
+        }
+        
+        e.preventDefault();
+        
+        let target = document.activeElement;
+        if (selected.length > 0) {
+            target = selected[selected.length - 1];
+        } else if (!target || !target.classList.contains('block')) {
+            target = getLastBlock();
+        }
+
+        let currentRef = target;
+        chunks.forEach(chunk => {
+            chunk = chunk.trim();
+            if (!chunk) return;
+            let newEl;
+            if (chunk.startsWith('$$') && chunk.endsWith('$$')) {
+                const latex = chunk.slice(2, -2).trim();
+                newEl = appendMathBlock(latex, currentRef ? currentRef.nextSibling : null);
+            } else {
+                newEl = appendTextBlock(chunk, currentRef ? currentRef.nextSibling : null);
+            }
+            if (newEl) currentRef = newEl;
+        });
+        
+        // Remove original selected blocks if pasting over them (standard editor behavior)
+        if (selected.length > 1) {
+             selected.forEach(b => b.remove());
+        }
+        if (currentRef) currentRef.focus();
+        saveState();
+    });
+
+    function deleteSelected() {
+        const selected = getSelectedBlocks();
+        if (selected.length === 0) return;
+        const firstSelected = selected[0];
+        let prev = getPreviousBlock(firstSelected);
+        
+        selected.forEach(b => b.remove());
+        
+        if (prev && prev.classList.contains('block')) {
+            prev.focus();
+            prev.classList.add('selected');
+        } else if (getFirstBlock()) {
+            getFirstBlock().focus();
+            getFirstBlock().classList.add('selected');
+        } else {
+            appendMathBlock().focus();
+        }
+        saveState();
+    }
+
     // Restore Theme
     if (localStorage.getItem('theme') === 'dark') {
         document.body.classList.add('dark-mode');
@@ -20,8 +648,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function getDocString() {
         let content = [];
-        for (const el of container.children) {
-            if (el.tagName.toLowerCase() === 'math-field') {
+        for (const el of getBlocks()) {
+            if (isMathBlock(el)) {
                 if (el.value.trim() !== '') content.push(`$$ ${el.value} $$`);
             } else if (el.classList.contains('text-line')) {
                 if (el.innerText.trim() !== '') content.push(el.innerText.trim());
@@ -31,24 +659,24 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function loadDocString(text) {
+        clearCrossBlockSelection();
+        clearSelection();
+        lastSelectedBlock = null;
         container.innerHTML = '';
+        ensureSelectionLayer();
         const chunks = text.split(/\n\s*\n/);
         chunks.forEach(chunk => {
             chunk = chunk.trim();
             if (!chunk) return;
             if (chunk.startsWith('$$') && chunk.endsWith('$$')) {
                 const latex = chunk.slice(2, -2).trim();
-                const mf = createMathBlock();
-                mf.value = latex;
-                container.appendChild(mf);
+                appendMathBlock(latex);
             } else {
-                const tb = createTextBlock();
-                tb.innerText = chunk;
-                container.appendChild(tb);
+                appendTextBlock(chunk);
             }
         });
-        if (container.children.length === 0) {
-            container.appendChild(createMathBlock());
+        if (getBlocks().length === 0) {
+            appendMathBlock();
         }
     }
 
@@ -58,6 +686,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Auto save on input
     container.addEventListener('input', () => {
+        if (hasExpandedCrossBlockSelection()) {
+            clearCrossBlockSelection();
+            clearSelection();
+        }
         saveState();
     });
 
@@ -90,52 +722,112 @@ document.addEventListener('DOMContentLoaded', () => {
         fileInput.value = '';
     });
 
-    function createMathBlock() {
+    function appendMathBlock(latex = null, refNode = null) {
         const mf = document.createElement('math-field');
         mf.classList.add('math-line', 'block');
+        
         setupBlock(mf, true);
+        ensureSelectionLayer();
+        container.insertBefore(mf, refNode ?? selectionLayer);
+        
+        // Settings must happen after element is mounted
+        mf.inlineShortcuts = null;
+        mf.macros = { ...mf.macros, pmb: { args: 1, def: "\\boldsymbol{#1}" } };
+        if (latex !== null) mf.value = latex;
         return mf;
     }
 
-    function createTextBlock() {
+    function appendTextBlock(text = null, refNode = null) {
         const div = document.createElement('div');
         div.contentEditable = "true";
         div.classList.add('text-line', 'block');
         setupBlock(div, false);
+        ensureSelectionLayer();
+        container.insertBefore(div, refNode ?? selectionLayer);
+        if (text !== null) div.innerText = text;
         return div;
     }
 
     addTextBtn.addEventListener('click', () => {
-        const b = createTextBlock();
-        container.appendChild(b);
+        clearCrossBlockSelection();
+        clearSelection();
+        const b = appendTextBlock();
         b.focus();
         saveState();
     });
     
     addMathBtn.addEventListener('click', () => {
-        const b = createMathBlock();
-        container.appendChild(b);
+        clearCrossBlockSelection();
+        clearSelection();
+        const b = appendMathBlock();
         b.focus();
         saveState();
     });
 
+
     function setupBlock(el, isMath) {
+        el.addEventListener('mousedown', (e) => {
+            if (e.shiftKey && lastSelectedBlock) {
+                e.preventDefault();
+                clearCrossBlockSelection();
+                const blocks = getBlocks();
+                const start = blocks.indexOf(lastSelectedBlock);
+                const end = blocks.indexOf(el);
+                const min = Math.min(start, end);
+                const max = Math.max(start, end);
+                clearSelection();
+                for (let i = min; i <= max; i++) {
+                    blocks[i].classList.add('selected');
+                }
+            } else {
+                clearCrossBlockSelection();
+                clearSelection();
+                el.classList.add('selected');
+                lastSelectedBlock = el;
+            }
+        }, true); // Use capture phase
+
+        el.addEventListener('focus', () => {
+            if (hasExpandedCrossBlockSelection()) {
+                clearCrossBlockSelection();
+            }
+            if (!el.classList.contains('selected')) {
+                clearSelection();
+                el.classList.add('selected');
+                lastSelectedBlock = el;
+            }
+        }, true); // Use capture phase
+
+        if (isMath) {
+            el.addEventListener('keydown', (e) => {
+                if (hasExpandedCrossBlockSelection()) return;
+                if (e.key === 'Enter' && !e.shiftKey && el.executeCommand('complete')) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    saveState();
+                }
+            }, true);
+        }
+
         el.addEventListener('keydown', (e) => {
+            if (hasExpandedCrossBlockSelection()) return;
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
-                const newEl = isMath ? createMathBlock() : createTextBlock();
-                el.parentNode.insertBefore(newEl, el.nextSibling);
+                const newEl = isMath ? appendMathBlock(null, el.nextSibling) : appendTextBlock(null, el.nextSibling);
+                clearSelection();
                 newEl.focus();
                 saveState();
             } else if (e.key === 'Backspace') {
                 const isEmpty = isMath ? el.value === '' : el.innerText.trim() === '';
-                if (isEmpty && container.children.length > 1) {
+                if (isEmpty && getBlocks().length > 1) {
+                    const selected = getSelectedBlocks();
+                    if (selected.length > 1) return; // handled by document event listener
                     e.preventDefault();
-                    const prev = el.previousElementSibling;
+                    const prev = getPreviousBlock(el);
                     if (prev) {
                         prev.focus();
-                        if (prev.tagName.toLowerCase() === 'math-field') {
-                            prev.executeCommand('moveToMathfieldEnd'); // Fixed capitalization
+                        if (isMathBlock(prev)) {
+                            prev.executeCommand('moveToMathfieldEnd');
                         } else {
                             const range = document.createRange();
                             const sel = window.getSelection();
@@ -149,21 +841,35 @@ document.addEventListener('DOMContentLoaded', () => {
                     saveState();
                 }
             } else if (e.key === 'ArrowUp') {
-                const prev = el.previousElementSibling;
-                if (prev) prev.focus();
+                const prev = getPreviousBlock(el);
+                if (prev) {
+                    if (e.shiftKey) {
+                        e.preventDefault();
+                        prev.classList.add('selected');
+                    } else {
+                        clearSelection();
+                    }
+                    prev.focus();
+                }
             } else if (e.key === 'ArrowDown') {
-                const next = el.nextElementSibling;
-                if (next) next.focus();
+                const next = getNextBlock(el);
+                if (next) {
+                    if (e.shiftKey) {
+                        e.preventDefault();
+                        next.classList.add('selected');
+                    } else {
+                        clearSelection();
+                    }
+                    next.focus();
+                }
             }
         });
     }
-
     const savedState = localStorage.getItem('docState');
     if (savedState) {
         loadDocString(savedState);
     } else {
-        const initialField = createMathBlock();
-        container.appendChild(initialField);
+        const initialField = appendMathBlock();
         initialField.focus();
     }
 });
