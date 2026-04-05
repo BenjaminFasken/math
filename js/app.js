@@ -73,6 +73,48 @@ document.addEventListener('DOMContentLoaded', () => {
         return Array.from(container.querySelectorAll('.selected'));
     }
 
+    function getTextBlockFromEvent(event) {
+        const eventTarget = event.target instanceof Element ? event.target.closest('.text-line') : null;
+        if (eventTarget) return eventTarget;
+
+        const activeTarget = document.activeElement instanceof Element
+            ? document.activeElement.closest('.text-line')
+            : null;
+        if (activeTarget) return activeTarget;
+
+        const selectionNode = window.getSelection()?.anchorNode;
+        const selectionTarget = selectionNode instanceof Element
+            ? selectionNode.closest('.text-line')
+            : selectionNode?.parentElement?.closest('.text-line');
+        if (selectionTarget) return selectionTarget;
+
+        const selectedTextBlock = getSelectedBlocks().find((block) => block.classList.contains('text-line'));
+        if (selectedTextBlock) return selectedTextBlock;
+
+        return lastSelectedBlock?.classList?.contains('text-line') ? lastSelectedBlock : null;
+    }
+
+    function getBlockFromEvent(event) {
+        const eventTarget = event.target instanceof Element ? event.target.closest('.block') : null;
+        if (eventTarget) return eventTarget;
+
+        const activeTarget = document.activeElement instanceof Element
+            ? document.activeElement.closest('.block')
+            : null;
+        if (activeTarget) return activeTarget;
+
+        const selectionNode = window.getSelection()?.anchorNode;
+        const selectionTarget = selectionNode instanceof Element
+            ? selectionNode.closest('.block')
+            : selectionNode?.parentElement?.closest('.block');
+        if (selectionTarget) return selectionTarget;
+
+        const selectedBlock = getSelectedBlocks()[0];
+        if (selectedBlock) return selectedBlock;
+
+        return lastSelectedBlock?.classList?.contains('block') ? lastSelectedBlock : null;
+    }
+
     function blocksToString(blocks) {
         let content = [];
         for (const el of blocks) {
@@ -85,18 +127,54 @@ document.addEventListener('DOMContentLoaded', () => {
         return content.join('\n\n');
     }
 
+    function splitPastedTextIntoBlocks(text) {
+        return text
+            .replace(/\r\n?/g, '\n')
+            .split('\n')
+            .filter((line) => line.trim() !== '');
+    }
+
+    function extractMathPasteValue(text) {
+        const trimmed = text.trim();
+        if (trimmed.startsWith('$$') && trimmed.endsWith('$$')) {
+            return trimmed.slice(2, -2).trim();
+        }
+        return trimmed;
+    }
+
+    function shouldPasteAsMath(text, sourceBlock = null) {
+        const trimmed = text.trim();
+        return isMathBlock(sourceBlock)
+            || (trimmed.startsWith('$$') && trimmed.endsWith('$$'));
+    }
+
+    function appendBlockFromText(text, refNode = null, sourceBlock = null) {
+        if (shouldPasteAsMath(text, sourceBlock)) {
+            return appendMathBlock(extractMathPasteValue(text), refNode);
+        }
+        return appendTextBlock(text, refNode);
+    }
+
     function getTextBlockValue(block) {
         return block.textContent ?? '';
     }
 
+    function ensureTextBlockPlaceholder(block) {
+        if (getTextBlockValue(block) === '' && block.innerHTML === '') {
+            block.innerHTML = '<br>';
+        }
+    }
+
     function setTextBlockValue(block, text) {
-        block.textContent = text;
+        if (text === '') {
+            block.innerHTML = '<br>';
+        } else {
+            block.textContent = text;
+        }
     }
 
     function getTextLength(block) {
-        const range = document.createRange();
-        range.selectNodeContents(block);
-        return range.toString().length;
+        return getTextBlockValue(block).length;
     }
 
     function getTextOffsetFromDomPosition(block, node, offset) {
@@ -111,7 +189,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function getTextPositionFromOffset(block, targetOffset) {
-        let remaining = clamp(targetOffset, 0, getTextLength(block));
+        const textLength = getTextLength(block);
+        if (textLength === 0) {
+            ensureTextBlockPlaceholder(block);
+            return { node: block, offset: 0 };
+        }
+
+        let remaining = clamp(targetOffset, 0, textLength);
         const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
         let node = walker.nextNode();
         let lastTextNode = null;
@@ -161,12 +245,19 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function setTextCaret(block, offset) {
-        const position = getTextPositionFromOffset(block, offset);
         const range = document.createRange();
         const selection = window.getSelection();
 
-        range.setStart(position.node, position.offset);
-        range.collapse(true);
+        if (getTextLength(block) === 0) {
+            ensureTextBlockPlaceholder(block);
+            range.selectNodeContents(block);
+            range.collapse(true);
+        } else {
+            const position = getTextPositionFromOffset(block, offset);
+            range.setStart(position.node, position.offset);
+            range.collapse(true);
+        }
+
         selection.removeAllRanges();
         selection.addRange(range);
     }
@@ -396,6 +487,14 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    function insertBlockBelow(block, isMath) {
+        const refNode = getNextBlock(block) ?? selectionLayer;
+        const newBlock = isMath ? appendMathBlock(null, refNode) : appendTextBlock(null, refNode);
+        placeCaretInBlock(newBlock, 0);
+        saveState();
+        return newBlock;
+    }
+
     function deleteCrossBlockSelection() {
         const selection = getNormalizedCrossBlockSelection();
         if (!selection || !hasExpandedCrossBlockSelection()) return null;
@@ -511,6 +610,32 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    function handleTextLineBeforeInput(e) {
+        const target = getTextBlockFromEvent(e);
+        if (!target || hasExpandedCrossBlockSelection()) return;
+        if (e.inputType === 'insertParagraph') {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            insertBlockBelow(target, false);
+        }
+    }
+
+    function handleTextLineEnterKey(e) {
+        const target = getTextBlockFromEvent(e);
+        if (!target || hasExpandedCrossBlockSelection()) return;
+        if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            insertBlockBelow(target, false);
+        }
+    }
+
+    window.addEventListener('beforeinput', handleTextLineBeforeInput, true);
+    document.addEventListener('beforeinput', handleTextLineBeforeInput, true);
+
+    window.addEventListener('keydown', handleTextLineEnterKey, true);
+    document.addEventListener('keydown', handleTextLineEnterKey, true);
+
     window.addEventListener('resize', () => {
         if (hasExpandedCrossBlockSelection()) {
             renderCrossBlockSelection();
@@ -568,52 +693,72 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
     
-    // We also need to handle Paste for multiple blocks.
-    document.addEventListener('paste', (e) => {
-        if (hasExpandedCrossBlockSelection()) {
-            deleteCrossBlockSelection();
+    function handleMultiBlockPaste(e, sourceBlock = null) {
+        if (e.__multiBlockPasteHandled) return;
+
+        const text = (e.clipboardData || window.clipboardData)?.getData('text') ?? '';
+        const selected = getSelectedBlocks();
+        const chunks = splitPastedTextIntoBlocks(text);
+        const hasCrossSelection = hasExpandedCrossBlockSelection();
+
+        if (!hasCrossSelection && selected.length <= 1 && chunks.length <= 1) {
             return;
         }
 
-        const text = (e.clipboardData || window.clipboardData).getData('text');
-        const selected = getSelectedBlocks();
-        const chunks = text.split(/\n\s*\n/);
-        
-        // Only override if pasting multiple blocks or pasting over multiple selected blocks
-        if (selected.length <= 1 && chunks.length <= 1) {
-            return; // Use default paste behavior
-        }
-        
+        e.__multiBlockPasteHandled = true;
         e.preventDefault();
-        
-        let target = document.activeElement;
-        if (selected.length > 0) {
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+
+        let target = sourceBlock ?? getBlockFromEvent(e);
+
+        if (hasCrossSelection) {
+            target = deleteCrossBlockSelection() ?? target;
+        } else if (selected.length > 0) {
             target = selected[selected.length - 1];
         } else if (!target || !target.classList.contains('block')) {
-            target = getLastBlock();
+            target = getBlockFromEvent(e) ?? getLastBlock();
+        }
+
+        if (!target) {
+            target = appendMathBlock();
         }
 
         let currentRef = target;
-        chunks.forEach(chunk => {
-            chunk = chunk.trim();
-            if (!chunk) return;
-            let newEl;
-            if (chunk.startsWith('$$') && chunk.endsWith('$$')) {
-                const latex = chunk.slice(2, -2).trim();
-                newEl = appendMathBlock(latex, currentRef ? currentRef.nextSibling : null);
+        const remainingChunks = [...chunks];
+
+        if (!hasCrossSelection && selected.length <= 1 && getBlockLength(target) === 0 && remainingChunks.length > 0) {
+            const firstChunk = remainingChunks.shift();
+            if (isMathBlock(target)) {
+                target.value = extractMathPasteValue(firstChunk);
             } else {
-                newEl = appendTextBlock(chunk, currentRef ? currentRef.nextSibling : null);
+                setTextBlockValue(target, firstChunk);
             }
+        }
+
+        remainingChunks.forEach((chunk) => {
+            const newEl = appendBlockFromText(chunk, currentRef ? currentRef.nextSibling : null, target);
             if (newEl) currentRef = newEl;
         });
-        
-        // Remove original selected blocks if pasting over them (standard editor behavior)
-        if (selected.length > 1) {
-             selected.forEach(b => b.remove());
+
+        if (!hasCrossSelection && selected.length > 1) {
+             selected.forEach((block) => block.remove());
         }
-        if (currentRef) currentRef.focus();
+
+        if (currentRef) {
+            placeCaretInBlock(currentRef, 0);
+        }
         saveState();
-    });
+    }
+
+    // Handle paste for multiple blocks before MathLive/contenteditable consume it.
+    window.addEventListener('paste', (e) => {
+        handleMultiBlockPaste(e);
+    }, true);
+
+    document.addEventListener('paste', (e) => {
+        handleMultiBlockPaste(e);
+    }, true);
 
     function deleteSelected() {
         const selected = getSelectedBlocks();
@@ -744,7 +889,7 @@ document.addEventListener('DOMContentLoaded', () => {
         setupBlock(div, false);
         ensureSelectionLayer();
         container.insertBefore(div, refNode ?? selectionLayer);
-        if (text !== null) div.innerText = text;
+        setTextBlockValue(div, text ?? '');
         return div;
     }
 
@@ -798,13 +943,30 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }, true); // Use capture phase
 
+        el.addEventListener('paste', (e) => {
+            handleMultiBlockPaste(e, el);
+        }, true);
+
         if (isMath) {
             el.addEventListener('keydown', (e) => {
                 if (hasExpandedCrossBlockSelection()) return;
-                if (e.key === 'Enter' && !e.shiftKey && el.executeCommand('complete')) {
+                if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && el.mode === 'latex') {
                     e.preventDefault();
                     e.stopPropagation();
+                    e.stopImmediatePropagation();
+                    el.executeCommand('complete');
                     saveState();
+                }
+            }, true);
+        }
+
+        if (!isMath) {
+            el.addEventListener('beforeinput', (e) => {
+                if (hasExpandedCrossBlockSelection()) return;
+                if (e.inputType === 'insertParagraph') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    insertBlockBelow(el, false);
                 }
             }, true);
         }
@@ -813,10 +975,8 @@ document.addEventListener('DOMContentLoaded', () => {
             if (hasExpandedCrossBlockSelection()) return;
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
-                const newEl = isMath ? appendMathBlock(null, el.nextSibling) : appendTextBlock(null, el.nextSibling);
-                clearSelection();
-                newEl.focus();
-                saveState();
+                e.stopPropagation();
+                insertBlockBelow(el, isMath);
             } else if (e.key === 'Backspace') {
                 const isEmpty = isMath ? el.value === '' : el.innerText.trim() === '';
                 if (isEmpty && getBlocks().length > 1) {
