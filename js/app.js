@@ -9,11 +9,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const selectionLayer = document.createElement('div');
     selectionLayer.className = 'document-selection-layer';
+    const HISTORY_STORAGE_KEY = 'docHistory';
+    const HISTORY_STORAGE_VERSION = 1;
+    const HISTORY_PERSIST_DELAY_MS = 250;
+    // Leave headroom for other localStorage keys such as docState/theme.
+    const MAX_HISTORY_STORAGE_BYTES = Math.floor(4.5 * 1024 * 1024);
 
     let lastSelectedBlock = null;
     let dragState = null;
     let crossBlockSelection = null;
     let suppressDocumentClickClear = false;
+    let historyStack = [];
+    let historyIndex = -1;
+    let isRestoringHistory = false;
+    let historyPersistTimer = null;
 
     function ensureSelectionLayer() {
         if (!selectionLayer.isConnected) {
@@ -60,13 +69,26 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function clearSelection(except = null) {
         getBlocks().forEach((block) => {
-            if (block !== except) block.classList.remove('selected');
+            if (block !== except) {
+                block.classList.remove('selected');
+                block.classList.remove('cross-selected');
+            }
         });
     }
 
     function clearCrossBlockSelection() {
         crossBlockSelection = null;
         selectionLayer.innerHTML = '';
+        container.classList.remove('cross-selecting');
+    }
+
+    function suppressNativeSelection() {
+        window.getSelection()?.removeAllRanges();
+
+        const activeElement = document.activeElement;
+        if (activeElement instanceof HTMLElement && activeElement !== document.body) {
+            activeElement.blur();
+        }
     }
 
     function getSelectedBlocks() {
@@ -98,6 +120,24 @@ document.addEventListener('DOMContentLoaded', () => {
         const eventTarget = event.target instanceof Element ? event.target.closest('.block') : null;
         if (eventTarget) return eventTarget;
 
+        const activeTarget = document.activeElement instanceof Element
+            ? document.activeElement.closest('.block')
+            : null;
+        if (activeTarget) return activeTarget;
+
+        const selectionNode = window.getSelection()?.anchorNode;
+        const selectionTarget = selectionNode instanceof Element
+            ? selectionNode.closest('.block')
+            : selectionNode?.parentElement?.closest('.block');
+        if (selectionTarget) return selectionTarget;
+
+        const selectedBlock = getSelectedBlocks()[0];
+        if (selectedBlock) return selectedBlock;
+
+        return lastSelectedBlock?.classList?.contains('block') ? lastSelectedBlock : null;
+    }
+
+    function getCurrentBlock() {
         const activeTarget = document.activeElement instanceof Element
             ? document.activeElement.closest('.block')
             : null;
@@ -431,7 +471,12 @@ document.addEventListener('DOMContentLoaded', () => {
         selectionLayer.innerHTML = '';
         clearSelection();
 
-        if (!hasExpandedCrossBlockSelection()) return;
+        if (!hasExpandedCrossBlockSelection()) {
+            container.classList.remove('cross-selecting');
+            return;
+        }
+
+        container.classList.add('cross-selecting');
 
         const blocks = getBlocks();
         const containerRect = container.getBoundingClientRect();
@@ -445,7 +490,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 ? getMathSelectionRects(block, start, end, containerRect)
                 : getTextSelectionRects(block, start, end, containerRect);
 
-            block.classList.add('selected');
+            block.classList.add('selected', 'cross-selected');
             rects.forEach(appendSelectionRect);
         }
     }
@@ -585,18 +630,23 @@ document.addEventListener('DOMContentLoaded', () => {
         dragState.focus = point;
         if (!dragState.isCrossBlock && point.index !== dragState.anchor.index) {
             dragState.isCrossBlock = true;
+            suppressNativeSelection();
         }
 
         if (!dragState.isCrossBlock) return;
 
         suppressDocumentClickClear = true;
-        window.getSelection().removeAllRanges();
+        suppressNativeSelection();
         crossBlockSelection = { anchor: dragState.anchor, focus: point };
         renderCrossBlockSelection();
     }, { capture: true });
 
     document.addEventListener('pointerup', finishPointerSelection, { capture: true });
     document.addEventListener('pointercancel', finishPointerSelection, { capture: true });
+    document.addEventListener('selectstart', (e) => {
+        if (!dragState?.isCrossBlock && !hasExpandedCrossBlockSelection()) return;
+        e.preventDefault();
+    }, { capture: true });
 
     document.addEventListener('click', (e) => {
         if (suppressDocumentClickClear) {
@@ -630,11 +680,28 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    function handleUndoRedoShortcuts(e) {
+        if (!(e.ctrlKey || e.metaKey) || e.altKey || e.isComposing) return;
+        if (e.key.toLowerCase() !== 'z') return;
+
+        e.preventDefault();
+        e.stopImmediatePropagation();
+
+        if (e.shiftKey) {
+            redoHistory();
+        } else {
+            undoHistory();
+        }
+    }
+
     window.addEventListener('beforeinput', handleTextLineBeforeInput, true);
     document.addEventListener('beforeinput', handleTextLineBeforeInput, true);
 
+    window.addEventListener('keydown', handleUndoRedoShortcuts, true);
     window.addEventListener('keydown', handleTextLineEnterKey, true);
     document.addEventListener('keydown', handleTextLineEnterKey, true);
+    window.addEventListener('beforeunload', persistHistoryNow);
+    window.addEventListener('pagehide', persistHistoryNow);
 
     window.addEventListener('resize', () => {
         if (hasExpandedCrossBlockSelection()) {
@@ -780,6 +847,264 @@ document.addEventListener('DOMContentLoaded', () => {
         saveState();
     }
 
+    function getHistorySnapshotKey(blocks) {
+        return JSON.stringify(blocks);
+    }
+
+    function getStorageByteLength(value) {
+        return new TextEncoder().encode(value).length;
+    }
+
+    function getSerializedHistoryEntry(snapshot) {
+        return {
+            b: snapshot.blocks.map((block) => [block.type === 'math' ? 1 : 0, block.value]),
+            f: [
+                snapshot.focus?.index ?? 0,
+                snapshot.focus?.offset ?? 0,
+                snapshot.focus?.isMath ? 1 : 0,
+            ],
+        };
+    }
+
+    function getHistoryStoragePayload(entries = historyStack, index = historyIndex) {
+        return JSON.stringify({
+            version: HISTORY_STORAGE_VERSION,
+            index: clamp(index, 0, Math.max(0, entries.length - 1)),
+            entries: entries.map(getSerializedHistoryEntry),
+        });
+    }
+
+    function getTrimmedHistoryStorage(entries = historyStack, index = historyIndex) {
+        if (entries.length === 0) {
+            return { entries: [], index: -1, payload: '' };
+        }
+
+        let trimmedEntries = entries.slice();
+        let trimmedIndex = clamp(index, 0, Math.max(0, trimmedEntries.length - 1));
+        let payload = getHistoryStoragePayload(trimmedEntries, trimmedIndex);
+
+        while (trimmedEntries.length > 1 && getStorageByteLength(payload) > MAX_HISTORY_STORAGE_BYTES) {
+            trimmedEntries = trimmedEntries.slice(1);
+            trimmedIndex = Math.max(0, trimmedIndex - 1);
+            payload = getHistoryStoragePayload(trimmedEntries, trimmedIndex);
+        }
+
+        return {
+            entries: trimmedEntries,
+            index: trimmedIndex,
+            payload,
+        };
+    }
+
+    function persistHistoryNow() {
+        if (historyPersistTimer !== null) {
+            window.clearTimeout(historyPersistTimer);
+            historyPersistTimer = null;
+        }
+
+        if (historyStack.length === 0) {
+            localStorage.removeItem(HISTORY_STORAGE_KEY);
+            return;
+        }
+
+        let trimmed = getTrimmedHistoryStorage();
+
+        while (trimmed.entries.length > 0) {
+            try {
+                localStorage.setItem(HISTORY_STORAGE_KEY, trimmed.payload);
+                return;
+            } catch {
+                if (trimmed.entries.length === 1) {
+                    break;
+                }
+
+                trimmed = getTrimmedHistoryStorage(
+                    trimmed.entries.slice(1),
+                    Math.max(0, trimmed.index - 1)
+                );
+            }
+        }
+
+        localStorage.removeItem(HISTORY_STORAGE_KEY);
+    }
+
+    function scheduleHistoryPersistence() {
+        if (historyPersistTimer !== null) {
+            window.clearTimeout(historyPersistTimer);
+        }
+
+        historyPersistTimer = window.setTimeout(() => {
+            historyPersistTimer = null;
+            persistHistoryNow();
+        }, HISTORY_PERSIST_DELAY_MS);
+    }
+
+    function parseStoredHistoryEntry(entry) {
+        if (!entry || !Array.isArray(entry.b)) return null;
+
+        const blocks = entry.b.map((block) => {
+            if (!Array.isArray(block) || block.length < 2) return null;
+
+            const [typeFlag, value] = block;
+            if ((typeFlag !== 0 && typeFlag !== 1) || typeof value !== 'string') {
+                return null;
+            }
+
+            return {
+                type: typeFlag === 1 ? 'math' : 'text',
+                value,
+            };
+        });
+
+        if (blocks.some((block) => block === null)) {
+            return null;
+        }
+
+        const focus = Array.isArray(entry.f) ? entry.f : [];
+        return {
+            blocks,
+            key: getHistorySnapshotKey(blocks),
+            focus: {
+                index: Number.isFinite(Number(focus[0])) ? Number(focus[0]) : 0,
+                offset: Number.isFinite(Number(focus[1])) ? Number(focus[1]) : 0,
+                isMath: focus[2] === 1,
+            },
+        };
+    }
+
+    function loadHistoryFromStorage() {
+        const storedHistory = localStorage.getItem(HISTORY_STORAGE_KEY);
+        if (!storedHistory) return false;
+
+        try {
+            const payload = JSON.parse(storedHistory);
+            if (payload?.version !== HISTORY_STORAGE_VERSION || !Array.isArray(payload.entries) || payload.entries.length === 0) {
+                throw new Error('Invalid history payload');
+            }
+
+            const entries = payload.entries.map(parseStoredHistoryEntry);
+            if (entries.some((entry) => entry === null)) {
+                throw new Error('Invalid history entry');
+            }
+
+            historyStack = entries;
+            historyIndex = clamp(Number(payload.index) || 0, 0, historyStack.length - 1);
+            restoreHistorySnapshot(historyStack[historyIndex]);
+            return true;
+        } catch {
+            localStorage.removeItem(HISTORY_STORAGE_KEY);
+            return false;
+        }
+    }
+
+    function getCurrentFocusSnapshot() {
+        const block = getCurrentBlock();
+        const blocks = getBlocks();
+        const index = block ? blocks.indexOf(block) : -1;
+
+        if (!block || index === -1) {
+            return { index: 0, offset: 0, isMath: true };
+        }
+
+        if (isMathBlock(block)) {
+            return {
+                index,
+                offset: clamp(block.position ?? block.lastOffset ?? 0, 0, block.lastOffset ?? 0),
+                isMath: true,
+            };
+        }
+
+        const selection = window.getSelection();
+        let offset = getTextLength(block);
+        if (selection?.anchorNode && block.contains(selection.anchorNode)) {
+            offset = getTextOffsetFromDomPosition(block, selection.anchorNode, selection.anchorOffset);
+        }
+
+        return {
+            index,
+            offset: clamp(offset, 0, getTextLength(block)),
+            isMath: false,
+        };
+    }
+
+    function getHistoryBlocksSnapshot() {
+        return getBlocks().map((block) => ({
+            type: isMathBlock(block) ? 'math' : 'text',
+            value: isMathBlock(block) ? block.value : getTextBlockValue(block),
+        }));
+    }
+
+    function getHistorySnapshot() {
+        const blocks = getHistoryBlocksSnapshot();
+        return {
+            blocks,
+            key: getHistorySnapshotKey(blocks),
+            focus: getCurrentFocusSnapshot(),
+        };
+    }
+
+    function recordHistorySnapshot(force = false) {
+        const snapshot = getHistorySnapshot();
+        const current = historyStack[historyIndex];
+
+        if (!force && current?.key === snapshot.key) {
+            current.focus = snapshot.focus;
+            scheduleHistoryPersistence();
+            return;
+        }
+
+        historyStack = historyStack.slice(0, historyIndex + 1);
+        historyStack.push(snapshot);
+        historyIndex = historyStack.length - 1;
+        scheduleHistoryPersistence();
+    }
+
+    function restoreHistorySnapshot(snapshot) {
+        if (!snapshot) return;
+
+        isRestoringHistory = true;
+        clearCrossBlockSelection();
+        clearSelection();
+        lastSelectedBlock = null;
+        container.innerHTML = '';
+        ensureSelectionLayer();
+
+        snapshot.blocks.forEach((block) => {
+            if (block.type === 'math') {
+                appendMathBlock(block.value);
+            } else {
+                appendTextBlock(block.value);
+            }
+        });
+
+        if (getBlocks().length === 0) {
+            appendMathBlock();
+        }
+
+        const blocks = getBlocks();
+        const target = blocks[clamp(snapshot.focus?.index ?? 0, 0, Math.max(0, blocks.length - 1))];
+        if (target) {
+            placeCaretInBlock(target, snapshot.focus?.offset ?? 0);
+        }
+
+        localStorage.setItem('docState', getDocString());
+        isRestoringHistory = false;
+    }
+
+    function undoHistory() {
+        if (historyIndex <= 0) return;
+        historyIndex -= 1;
+        restoreHistorySnapshot(historyStack[historyIndex]);
+        scheduleHistoryPersistence();
+    }
+
+    function redoHistory() {
+        if (historyIndex >= historyStack.length - 1) return;
+        historyIndex += 1;
+        restoreHistorySnapshot(historyStack[historyIndex]);
+        scheduleHistoryPersistence();
+    }
+
     // Restore Theme
     if (localStorage.getItem('theme') === 'dark') {
         document.body.classList.add('dark-mode');
@@ -827,6 +1152,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function saveState() {
         localStorage.setItem('docState', getDocString());
+        if (!isRestoringHistory) {
+            recordHistorySnapshot();
+        }
     }
 
     // Auto save on input
@@ -1025,11 +1353,14 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
     }
-    const savedState = localStorage.getItem('docState');
-    if (savedState) {
-        loadDocString(savedState);
-    } else {
-        const initialField = appendMathBlock();
-        initialField.focus();
+    if (!loadHistoryFromStorage()) {
+        const savedState = localStorage.getItem('docState');
+        if (savedState) {
+            loadDocString(savedState);
+        } else {
+            const initialField = appendMathBlock();
+            initialField.focus();
+        }
+        recordHistorySnapshot(true);
     }
 });

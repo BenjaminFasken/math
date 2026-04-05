@@ -134,9 +134,28 @@ math-field:not(:focus-within)::part(virtual-keyboard-toggle) {
     border-radius: 4px;
 }
 
+.document.cross-selecting .cross-selected {
+    background-color: transparent !important;
+}
+
+.document.cross-selecting .block {
+    -webkit-user-select: none;
+    user-select: none;
+    caret-color: transparent;
+}
+
+.document.cross-selecting ::selection {
+    background: transparent;
+    color: inherit;
+}
+
 body.dark-mode .selected {
     background-color: rgba(33, 150, 243, 0.16) !important;
     border: 1px solid rgba(33, 150, 243, 0.8) !important;
+}
+
+body.dark-mode .document.cross-selecting .cross-selected {
+    background-color: transparent !important;
 }
 
 body.dark-mode .selection-rect {
