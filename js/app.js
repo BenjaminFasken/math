@@ -1,4 +1,4 @@
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', () => { // codex resume 019d5c83-6839-7680-8d6f-6bee9c0e283c
     const container = document.getElementById('editor-container');
     const toggleThemeBtn = document.getElementById('toggle-theme');
     const addTextBtn = document.getElementById('add-text');
@@ -1150,6 +1150,25 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    function stripLoadedFileComments(text) {
+        return text
+            .replace(/\r\n?/g, '\n')
+            .split('\n')
+            .map((line) => {
+                if (line.trimStart().startsWith('#')) {
+                    return '';
+                }
+
+                const commentIndex = line.indexOf('#');
+                if (commentIndex === -1) {
+                    return line;
+                }
+
+                return line.slice(0, commentIndex).trimEnd();
+            })
+            .join('\n');
+    }
+
     function saveState() {
         localStorage.setItem('docState', getDocString());
         if (!isRestoringHistory) {
@@ -1187,7 +1206,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!file) return;
         const reader = new FileReader();
         reader.onload = (ev) => {
-            loadDocString(ev.target.result);
+            loadDocString(stripLoadedFileComments(ev.target.result));
             saveState();
         };
         reader.readAsText(file);
@@ -1205,7 +1224,12 @@ document.addEventListener('DOMContentLoaded', () => {
         
         // Settings must happen after element is mounted
         mf.inlineShortcuts = null;
-        mf.macros = { ...mf.macros, pmb: { args: 1, def: "\\boldsymbol{#1}" } };
+        mf.macros = {
+            ...mf.macros,
+            const: { args: 1, def: "\\boldsymbol{#1}" },
+            eig: "\\text{eig}",
+            eigv: "\\text{eigv}",
+        };
         if (latex !== null) mf.value = latex;
         return mf;
     }
